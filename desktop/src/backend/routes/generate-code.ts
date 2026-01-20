@@ -5,7 +5,7 @@ import { createOpenAI } from '@ai-sdk/openai'
 import { createGoogleGenerativeAI } from '@ai-sdk/google'
 import { streamText } from 'ai'
 import { SecureStorage } from '../../main/secure-storage'
-import { ConfigStore } from '../../main/config-store'
+import { ConfigStore, CustomAIProvider } from '../../main/config-store'
 
 interface ConversationMessage {
   id: string
@@ -29,6 +29,116 @@ export function createGenerateCodeRoute(
 ): Router {
   const router = Router()
 
+  // Helper to call custom AI provider
+  async function callCustomProvider(
+    provider: CustomAIProvider,
+    apiKey: string,
+    systemPrompt: string,
+    messages: Array<{ role: 'user' | 'assistant'; content: string }>,
+    onChunk: (chunk: string) => void
+  ): Promise<string> {
+    const url = `${provider.baseUrl}${provider.modelEndpoint}`
+
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    }
+
+    if (apiKey && provider.apiKeyHeader) {
+      headers[provider.apiKeyHeader] = `${provider.apiKeyPrefix}${apiKey}`
+    }
+
+    let requestBody: Record<string, unknown>
+
+    if (provider.requestFormat === 'openai') {
+      requestBody = {
+        model: provider.defaultModel,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          ...messages,
+        ],
+        stream: provider.supportsStreaming,
+        temperature: configStore.get('temperature'),
+        max_tokens: configStore.get('maxTokens'),
+      }
+    } else if (provider.requestFormat === 'anthropic') {
+      requestBody = {
+        model: provider.defaultModel,
+        system: systemPrompt,
+        messages,
+        stream: provider.supportsStreaming,
+        temperature: configStore.get('temperature'),
+        max_tokens: configStore.get('maxTokens'),
+      }
+    } else {
+      // Custom format - use OpenAI-style as default
+      requestBody = {
+        model: provider.defaultModel,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          ...messages,
+        ],
+        stream: provider.supportsStreaming,
+        temperature: configStore.get('temperature'),
+        max_tokens: configStore.get('maxTokens'),
+      }
+    }
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(requestBody),
+    })
+
+    if (!response.ok) {
+      const errorText = await response.text()
+      throw new Error(`Custom provider error: ${response.status} - ${errorText}`)
+    }
+
+    let fullResponse = ''
+
+    if (provider.supportsStreaming && response.body) {
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        const chunk = decoder.decode(value)
+        const lines = chunk.split('\n')
+
+        for (const line of lines) {
+          if (line.startsWith('data: ') && line !== 'data: [DONE]') {
+            try {
+              const data = JSON.parse(line.slice(6))
+              // Handle OpenAI-style streaming
+              const content = data.choices?.[0]?.delta?.content ||
+                data.delta?.text ||
+                data.content ||
+                ''
+              if (content) {
+                fullResponse += content
+                onChunk(content)
+              }
+            } catch {
+              // Ignore parse errors
+            }
+          }
+        }
+      }
+    } else {
+      const data = await response.json()
+      // Extract content based on format
+      fullResponse = data.choices?.[0]?.message?.content ||
+        data.content?.[0]?.text ||
+        data.response ||
+        JSON.stringify(data)
+      onChunk(fullResponse)
+    }
+
+    return fullResponse
+  }
+
   router.post('/generate-ai-code-stream', async (req: Request, res: Response) => {
     try {
       const { prompt, model, context, isEdit = false } = req.body
@@ -37,37 +147,14 @@ export function createGenerateCodeRoute(
         return res.status(400).json({ success: false, error: 'Prompt is required' })
       }
 
+      // Get the active AI provider from config
+      const aiProvider = configStore.get('aiProvider') || 'groq'
+
       // Get API keys from secure storage
       const groqKey = await secureStorage.getKey('GROQ_API_KEY')
       const anthropicKey = await secureStorage.getKey('ANTHROPIC_API_KEY')
       const openaiKey = await secureStorage.getKey('OPENAI_API_KEY')
       const geminiKey = await secureStorage.getKey('GEMINI_API_KEY')
-
-      // Determine which provider to use based on model
-      let provider: ReturnType<typeof createGroq | typeof createAnthropic | typeof createOpenAI | typeof createGoogleGenerativeAI>
-      let actualModel = model || configStore.get('defaultModel')
-
-      if (actualModel.startsWith('anthropic/') && anthropicKey) {
-        provider = createAnthropic({ apiKey: anthropicKey })
-        actualModel = actualModel.replace('anthropic/', '')
-      } else if (actualModel.startsWith('openai/') && openaiKey) {
-        provider = createOpenAI({ apiKey: openaiKey })
-        actualModel = actualModel.replace('openai/', '')
-      } else if (actualModel.startsWith('google/') && geminiKey) {
-        provider = createGoogleGenerativeAI({ apiKey: geminiKey })
-        actualModel = actualModel.replace('google/', '')
-      } else if (groqKey) {
-        provider = createGroq({ apiKey: groqKey })
-        // Default to Groq with Kimi model
-        if (actualModel.includes('kimi') || !actualModel.includes('/')) {
-          actualModel = 'moonshotai/kimi-k2-instruct-0905'
-        }
-      } else {
-        return res.status(400).json({
-          success: false,
-          error: 'No AI provider configured. Please add at least one API key in Settings.',
-        })
-      }
 
       // Initialize conversation state
       if (!conversationState) {
@@ -115,20 +202,73 @@ export function createGenerateCodeRoute(
 
       sendEvent({ type: 'status', message: 'Generating code...' })
 
-      // Stream the response
-      const result = await streamText({
-        model: provider(actualModel),
-        system: systemPrompt,
-        messages: aiMessages,
-        temperature: configStore.get('temperature'),
-        maxTokens: configStore.get('maxTokens'),
-      })
-
       let fullResponse = ''
 
-      for await (const chunk of result.textStream) {
-        fullResponse += chunk
-        sendEvent({ type: 'stream', content: chunk })
+      // Check if using custom provider
+      if (aiProvider.startsWith('custom:')) {
+        const providerName = aiProvider.replace('custom:', '')
+        const customProviders = configStore.get('customAIProviders') || []
+        const customProvider = customProviders.find((p: CustomAIProvider) => p.name === providerName)
+
+        if (!customProvider) {
+          return res.status(400).json({
+            success: false,
+            error: `Custom AI provider "${providerName}" not found`,
+          })
+        }
+
+        const apiKey = await secureStorage.getCustomProviderKey(providerName)
+        if (!apiKey) {
+          return res.status(400).json({
+            success: false,
+            error: `API key not configured for custom provider "${providerName}"`,
+          })
+        }
+
+        fullResponse = await callCustomProvider(
+          customProvider,
+          apiKey,
+          systemPrompt,
+          aiMessages,
+          (chunk) => sendEvent({ type: 'stream', content: chunk })
+        )
+      } else {
+        // Use built-in providers
+        let provider: ReturnType<typeof createGroq | typeof createAnthropic | typeof createOpenAI | typeof createGoogleGenerativeAI>
+        let actualModel = model || configStore.get('defaultModel')
+
+        if (aiProvider === 'anthropic' && anthropicKey) {
+          provider = createAnthropic({ apiKey: anthropicKey })
+          actualModel = actualModel.startsWith('anthropic/') ? actualModel.replace('anthropic/', '') : 'claude-3-5-sonnet-20241022'
+        } else if (aiProvider === 'openai' && openaiKey) {
+          provider = createOpenAI({ apiKey: openaiKey })
+          actualModel = actualModel.startsWith('openai/') ? actualModel.replace('openai/', '') : 'gpt-4o'
+        } else if (aiProvider === 'google' && geminiKey) {
+          provider = createGoogleGenerativeAI({ apiKey: geminiKey })
+          actualModel = actualModel.startsWith('google/') ? actualModel.replace('google/', '') : 'gemini-1.5-pro'
+        } else if (groqKey) {
+          provider = createGroq({ apiKey: groqKey })
+          actualModel = 'moonshotai/kimi-k2-instruct-0905'
+        } else {
+          return res.status(400).json({
+            success: false,
+            error: 'No AI provider configured. Please add at least one API key in Settings.',
+          })
+        }
+
+        // Stream the response
+        const result = await streamText({
+          model: provider(actualModel),
+          system: systemPrompt,
+          messages: aiMessages,
+          temperature: configStore.get('temperature'),
+          maxTokens: configStore.get('maxTokens'),
+        })
+
+        for await (const chunk of result.textStream) {
+          fullResponse += chunk
+          sendEvent({ type: 'stream', content: chunk })
+        }
       }
 
       // Extract code from response

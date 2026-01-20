@@ -2,7 +2,8 @@ import * as keytar from 'keytar'
 
 const SERVICE_NAME = 'OpenLovableDesktop'
 
-export type ApiKeyName =
+// Built-in provider keys
+export type BuiltInKeyName =
   | 'FIRECRAWL_API_KEY'
   | 'GROQ_API_KEY'
   | 'ANTHROPIC_API_KEY'
@@ -14,7 +15,7 @@ export type ApiKeyName =
   | 'VERCEL_PROJECT_ID'
   | 'MORPH_API_KEY'
 
-const ALL_KEYS: ApiKeyName[] = [
+const BUILT_IN_KEYS: BuiltInKeyName[] = [
   'FIRECRAWL_API_KEY',
   'GROQ_API_KEY',
   'ANTHROPIC_API_KEY',
@@ -28,44 +29,114 @@ const ALL_KEYS: ApiKeyName[] = [
 ]
 
 export class SecureStorage {
-  async setKey(keyName: ApiKeyName, value: string): Promise<void> {
+  // Set any key (built-in or custom)
+  async setKey(keyName: string, value: string): Promise<void> {
     await keytar.setPassword(SERVICE_NAME, keyName, value)
   }
 
-  async getKey(keyName: ApiKeyName): Promise<string | null> {
+  // Get any key (built-in or custom)
+  async getKey(keyName: string): Promise<string | null> {
     return await keytar.getPassword(SERVICE_NAME, keyName)
   }
 
-  async deleteKey(keyName: ApiKeyName): Promise<boolean> {
+  // Delete any key (built-in or custom)
+  async deleteKey(keyName: string): Promise<boolean> {
     return await keytar.deletePassword(SERVICE_NAME, keyName)
   }
 
-  async getAllKeys(): Promise<Record<ApiKeyName, string | null>> {
-    const result: Partial<Record<ApiKeyName, string | null>> = {}
-    for (const keyName of ALL_KEYS) {
+  // Get all built-in keys
+  async getAllBuiltInKeys(): Promise<Record<BuiltInKeyName, string | null>> {
+    const result: Partial<Record<BuiltInKeyName, string | null>> = {}
+    for (const keyName of BUILT_IN_KEYS) {
       result[keyName] = await this.getKey(keyName)
     }
-    return result as Record<ApiKeyName, string | null>
+    return result as Record<BuiltInKeyName, string | null>
   }
 
-  async hasRequiredKeys(): Promise<{ valid: boolean; missing: string[] }> {
-    const firecrawl = await this.getKey('FIRECRAWL_API_KEY')
-    const groq = await this.getKey('GROQ_API_KEY')
-    const anthropic = await this.getKey('ANTHROPIC_API_KEY')
-    const openai = await this.getKey('OPENAI_API_KEY')
-    const gemini = await this.getKey('GEMINI_API_KEY')
+  // Get all keys including custom provider keys
+  async getAllKeys(customKeyNames: string[] = []): Promise<Record<string, string | null>> {
+    const result: Record<string, string | null> = {}
 
+    // Get built-in keys
+    for (const keyName of BUILT_IN_KEYS) {
+      result[keyName] = await this.getKey(keyName)
+    }
+
+    // Get custom provider keys
+    for (const keyName of customKeyNames) {
+      result[keyName] = await this.getKey(keyName)
+    }
+
+    return result
+  }
+
+  // Helper to generate custom provider key name
+  getCustomKeyName(providerName: string): string {
+    return `CUSTOM_${providerName.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_API_KEY`
+  }
+
+  // Store a custom provider API key
+  async setCustomProviderKey(providerName: string, value: string): Promise<void> {
+    const keyName = this.getCustomKeyName(providerName)
+    await this.setKey(keyName, value)
+  }
+
+  // Get a custom provider API key
+  async getCustomProviderKey(providerName: string): Promise<string | null> {
+    const keyName = this.getCustomKeyName(providerName)
+    return await this.getKey(keyName)
+  }
+
+  // Delete a custom provider API key
+  async deleteCustomProviderKey(providerName: string): Promise<boolean> {
+    const keyName = this.getCustomKeyName(providerName)
+    return await this.deleteKey(keyName)
+  }
+
+  // Validate required keys based on selected providers
+  async hasRequiredKeys(
+    aiProvider: string,
+    scrapingProvider: string,
+    customAIProviderName?: string,
+    customScrapingProviderName?: string
+  ): Promise<{ valid: boolean; missing: string[] }> {
     const missing: string[] = []
 
-    if (!firecrawl) {
-      missing.push('FIRECRAWL_API_KEY')
+    // Check AI provider
+    if (aiProvider === 'custom' && customAIProviderName) {
+      const customKey = await this.getCustomProviderKey(customAIProviderName)
+      if (!customKey) {
+        missing.push(`Custom AI Provider (${customAIProviderName}) API Key`)
+      }
+    } else if (aiProvider !== 'custom') {
+      const aiKeys: Record<string, BuiltInKeyName> = {
+        groq: 'GROQ_API_KEY',
+        anthropic: 'ANTHROPIC_API_KEY',
+        openai: 'OPENAI_API_KEY',
+        google: 'GEMINI_API_KEY',
+      }
+      const keyName = aiKeys[aiProvider]
+      if (keyName) {
+        const key = await this.getKey(keyName)
+        if (!key) {
+          missing.push(`${aiProvider.charAt(0).toUpperCase() + aiProvider.slice(1)} API Key`)
+        }
+      }
     }
 
-    // At least one AI provider is required
-    const hasAiProvider = groq || anthropic || openai || gemini
-    if (!hasAiProvider) {
-      missing.push('At least one AI provider (GROQ, ANTHROPIC, OPENAI, or GEMINI)')
+    // Check scraping provider
+    if (scrapingProvider === 'custom' && customScrapingProviderName) {
+      const customKey = await this.getCustomProviderKey(customScrapingProviderName)
+      if (!customKey) {
+        missing.push(`Custom Scraping Provider (${customScrapingProviderName}) API Key`)
+      }
+    } else if (scrapingProvider === 'firecrawl') {
+      const firecrawlKey = await this.getKey('FIRECRAWL_API_KEY')
+      if (!firecrawlKey) {
+        missing.push('Firecrawl API Key')
+      }
     }
+    // 'jina' and 'local' don't require API keys
 
     return {
       valid: missing.length === 0,
@@ -73,3 +144,5 @@ export class SecureStorage {
     }
   }
 }
+
+export type { BuiltInKeyName }

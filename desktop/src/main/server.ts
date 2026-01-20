@@ -39,13 +39,23 @@ export async function startBackendServer(): Promise<number> {
 
   // API key validation endpoint
   app.get('/api/validate-keys', async (_, res) => {
-    const validation = await secureStorage.hasRequiredKeys()
+    const aiProvider = configStore.get('aiProvider') || 'groq'
+    const scrapingProvider = configStore.get('scrapingProvider') || 'jina'
+    const customAIProvider = aiProvider.startsWith('custom:') ? aiProvider.replace('custom:', '') : undefined
+    const customScrapingProvider = scrapingProvider.startsWith('custom:') ? scrapingProvider.replace('custom:', '') : undefined
+
+    const validation = await secureStorage.hasRequiredKeys(
+      aiProvider.startsWith('custom:') ? 'custom' : aiProvider,
+      scrapingProvider.startsWith('custom:') ? 'custom' : scrapingProvider,
+      customAIProvider,
+      customScrapingProvider
+    )
     res.json(validation)
   })
 
   // Mount route handlers
   app.use('/api', createGenerateCodeRoute(secureStorage, configStore))
-  app.use('/api', createScrapeUrlRoute(secureStorage))
+  app.use('/api', createScrapeUrlRoute(secureStorage, configStore))
   app.use('/api', createSandboxRoutes(secureStorage, configStore))
   app.use('/api', createAnalyzeEditRoute(secureStorage, configStore))
 
